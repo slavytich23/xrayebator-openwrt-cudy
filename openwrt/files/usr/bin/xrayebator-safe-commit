@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -eu
+
+SERVICE=/etc/init.d/xrayebator-safe
+PENDING=/var/run/xrayebator-safe.pending
+GUARD=/usr/libexec/xrayebator-safe/route-guard
+
+[ -e "$PENDING" ] || {
+	echo 'NO_PENDING_ACTIVATION=true' >&2
+	exit 1
+}
+
+status="$($GUARD status)"
+echo "$status" | grep -q '^POLICY_INSTALLED=true$'
+echo "$status" | grep -q '^TUN_ROUTE_ACTIVE=true$'
+
+"$SERVICE" enable
+rm -f "$PENDING"
+echo 'XRAYEBATOR_SAFE_COMMITTED=true'

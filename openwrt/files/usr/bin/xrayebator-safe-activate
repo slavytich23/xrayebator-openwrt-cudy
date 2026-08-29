@@ -1,0 +1,30 @@
+#!/bin/sh
+
+set -eu
+
+SERVICE=/etc/init.d/xrayebator-safe
+PENDING=/var/run/xrayebator-safe.pending
+TIMEOUT="${1:-90}"
+
+case "$TIMEOUT" in
+	*[!0-9]*|'')
+		echo 'TIMEOUT_INVALID=true' >&2
+		exit 2
+		;;
+esac
+
+if [ "$TIMEOUT" -lt 30 ] || [ "$TIMEOUT" -gt 600 ]; then
+	echo 'TIMEOUT_OUT_OF_RANGE=true' >&2
+	exit 2
+fi
+
+"$SERVICE" check >/dev/null
+umask 077
+: >"$PENDING"
+"$SERVICE" start
+
+nohup sh -c "sleep $TIMEOUT; if [ -e '$PENDING' ]; then '$SERVICE' stop; '$SERVICE' disable; logger -t xrayebator-safe 'automatic rollback restored direct internet'; fi" </dev/null >/dev/null 2>&1 &
+
+echo 'XRAYEBATOR_SAFE_STARTED=true'
+echo "ROLLBACK_SECONDS=$TIMEOUT"
+echo 'COMMIT_REQUIRED=true'

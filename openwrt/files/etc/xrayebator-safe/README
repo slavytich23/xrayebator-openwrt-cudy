@@ -1,0 +1,11 @@
+This directory intentionally contains no client.json.
+
+Activation sequence:
+1. Copy a private, locally generated client.json here and set mode 0600.
+2. Run: /etc/init.d/xrayebator-safe check
+3. Run: xrayebator-safe-activate 90
+4. Verify router access, DNS, HTTPS, tunnel egress and fail-closed behavior.
+5. Run: xrayebator-safe-commit
+
+If checks fail or the router becomes unreachable, wait for automatic rollback.
+Manual rollback: xrayebator-safe-rollback

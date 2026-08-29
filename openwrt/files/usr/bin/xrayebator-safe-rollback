@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+SERVICE=/etc/init.d/xrayebator-safe
+PENDING=/var/run/xrayebator-safe.pending
+
+"$SERVICE" stop || true
+"$SERVICE" disable || true
+rm -f "$PENDING"
+echo 'DIRECT_INTERNET_RESTORED=true'

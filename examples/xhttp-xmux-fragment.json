@@ -1,0 +1,13 @@
+{
+  "streamSettings": {
+    "network": "xhttp",
+    "xhttpSettings": {
+      "mode": "packet-up",
+      "extra": {
+        "xmux": {
+          "maxConnections": 1
+        }
+      }
+    }
+  }
+}

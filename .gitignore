@@ -1,0 +1,34 @@
+# Private connection material
+**/client.json
+**/*.secret.*
+**/secrets/
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+
+# Local state and evidence
+evidence/
+logs/
+*.log
+*.pcap
+*.pcapng
+*.status.json
+
+# Firmware/build output
+/bin/
+/build/
+/output/
+*.bin
+*.img
+*.itb
+*.ubi
+*.tar
+*.tar.gz
+*.tar.zst
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

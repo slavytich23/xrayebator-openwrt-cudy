@@ -1,0 +1,264 @@
+#!/bin/sh
+
+set -u
+
+XRAY="${XRAYEBATOR_XRAY_BIN:-/usr/bin/xray}"
+CONFIG="${XRAYEBATOR_CONFIG:-/etc/xrayebator-safe/client.json}"
+TUN_DEVICE="${XRAYEBATOR_TUN_DEVICE:-xrayebator0}"
+CHECK_INTERVAL="${XRAYEBATOR_MEMORY_CHECK_INTERVAL:-5}"
+MAX_RSS_KB="${XRAYEBATOR_MAX_RSS_KB:-105000}"
+MIN_AVAILABLE_KB="${XRAYEBATOR_MIN_AVAILABLE_KB:-30000}"
+PRESSURE_CONFIRMATIONS="${XRAYEBATOR_PRESSURE_CONFIRMATIONS:-3}"
+RESTART_DELAY="${XRAYEBATOR_RESTART_DELAY:-2}"
+STOP_TIMEOUT="${XRAYEBATOR_STOP_TIMEOUT:-10}"
+GOMEMLIMIT="${XRAYEBATOR_GOMEMLIMIT:-80MiB}"
+GOGC="${XRAYEBATOR_GOGC:-50}"
+HEALTH_CHECK_INTERVAL="${XRAYEBATOR_HEALTH_CHECK_INTERVAL:-30}"
+HEALTH_FAILURE_CONFIRMATIONS="${XRAYEBATOR_HEALTH_FAILURE_CONFIRMATIONS:-3}"
+HEALTH_TIMEOUT="${XRAYEBATOR_HEALTH_TIMEOUT:-8}"
+HEALTH_RESTART_COOLDOWN="${XRAYEBATOR_HEALTH_RESTART_COOLDOWN:-600}"
+HEALTH_FIXED_URL="${XRAYEBATOR_HEALTH_FIXED_URL:-https://one.one.one.one/cdn-cgi/trace}"
+HEALTH_FIXED_RESOLVE="${XRAYEBATOR_HEALTH_FIXED_RESOLVE:-one.one.one.one:443:1.1.1.1}"
+HEALTH_NAMED_URL="${XRAYEBATOR_HEALTH_NAMED_URL:-https://example.com/}"
+DIRECT_FIXED_URL="${XRAYEBATOR_DIRECT_FIXED_URL:-$HEALTH_FIXED_URL}"
+DIRECT_FIXED_RESOLVE="${XRAYEBATOR_DIRECT_FIXED_RESOLVE:-$HEALTH_FIXED_RESOLVE}"
+DIRECT_NAMED_URL="${XRAYEBATOR_DIRECT_NAMED_URL:-$HEALTH_NAMED_URL}"
+HEALTH_NAMESPACE="${XRAYEBATOR_HEALTH_NAMESPACE:-xrayhealth}"
+HEALTH_HOST_VETH="${XRAYEBATOR_HEALTH_HOST_VETH:-xrh-host}"
+HEALTH_CLIENT_VETH="${XRAYEBATOR_HEALTH_CLIENT_VETH:-xrh-client}"
+HEALTH_BRIDGE="${XRAYEBATOR_HEALTH_BRIDGE:-br-lan}"
+HEALTH_ADDRESS="${XRAYEBATOR_HEALTH_ADDRESS:-192.168.10.252/24}"
+HEALTH_GATEWAY="${XRAYEBATOR_HEALTH_GATEWAY:-192.168.10.1}"
+HEALTH_DNS_SERVER="${XRAYEBATOR_HEALTH_DNS_SERVER:-$HEALTH_GATEWAY}"
+HEALTH_DNS_NAME="${XRAYEBATOR_HEALTH_DNS_NAME:-example.com}"
+INCIDENT_LOG="${XRAYEBATOR_INCIDENT_LOG:-/root/xrayebator-incidents.log}"
+
+child_pid=''
+health_namespace_ready=false
+rss_kb=''
+available_kb=''
+last_health_restart_uptime=0
+post_upstream_retry_available=false
+
+log() {
+	logger -t xrayebator-supervisor -- "$*"
+}
+
+remove_tun() {
+	ip link del dev "$TUN_DEVICE" >/dev/null 2>&1 || true
+}
+
+remove_health_namespace() {
+	ip netns del "$HEALTH_NAMESPACE" >/dev/null 2>&1 || true
+	ip link del dev "$HEALTH_HOST_VETH" >/dev/null 2>&1 || true
+	rm -f "/etc/netns/$HEALTH_NAMESPACE/resolv.conf" >/dev/null 2>&1 || true
+	rmdir "/etc/netns/$HEALTH_NAMESPACE" >/dev/null 2>&1 || true
+	health_namespace_ready=false
+}
+
+setup_health_namespace() {
+	remove_health_namespace
+	mkdir -p "/etc/netns/$HEALTH_NAMESPACE" || return 1
+	printf 'nameserver %s\noptions timeout:2 attempts:2\n' "$HEALTH_DNS_SERVER" > "/etc/netns/$HEALTH_NAMESPACE/resolv.conf" || return 1
+	ip netns add "$HEALTH_NAMESPACE" || { remove_health_namespace; return 1; }
+	ip link add "$HEALTH_HOST_VETH" type veth peer name "$HEALTH_CLIENT_VETH" || { remove_health_namespace; return 1; }
+	ip link set "$HEALTH_HOST_VETH" master "$HEALTH_BRIDGE" || { remove_health_namespace; return 1; }
+	ip link set "$HEALTH_HOST_VETH" up || { remove_health_namespace; return 1; }
+	ip link set "$HEALTH_CLIENT_VETH" netns "$HEALTH_NAMESPACE" || { remove_health_namespace; return 1; }
+	ip -n "$HEALTH_NAMESPACE" addr add "$HEALTH_ADDRESS" dev "$HEALTH_CLIENT_VETH" || { remove_health_namespace; return 1; }
+	ip -n "$HEALTH_NAMESPACE" link set lo up || { remove_health_namespace; return 1; }
+	ip -n "$HEALTH_NAMESPACE" link set "$HEALTH_CLIENT_VETH" up || { remove_health_namespace; return 1; }
+	ip -n "$HEALTH_NAMESPACE" route add default via "$HEALTH_GATEWAY" || { remove_health_namespace; return 1; }
+	health_namespace_ready=true
+}
+
+probe_tunnel_health() {
+	[ "$health_namespace_ready" = true ] || return 1
+	dns_ok=false
+	fixed_ok=false
+	named_ok=false
+	probe_successes=0
+	ip netns exec "$HEALTH_NAMESPACE" nslookup -type=A "$HEALTH_DNS_NAME" "$HEALTH_DNS_SERVER" >/dev/null 2>&1 && {
+		dns_ok=true
+		probe_successes=$((probe_successes + 1))
+	}
+	ip netns exec "$HEALTH_NAMESPACE" curl -4 --connect-timeout "$HEALTH_TIMEOUT" --max-time "$HEALTH_TIMEOUT" \
+		--resolve "$HEALTH_FIXED_RESOLVE" -sS -o /dev/null "$HEALTH_FIXED_URL" >/dev/null 2>&1 && {
+		fixed_ok=true
+		probe_successes=$((probe_successes + 1))
+	}
+	ip netns exec "$HEALTH_NAMESPACE" curl -4 --connect-timeout "$HEALTH_TIMEOUT" --max-time "$HEALTH_TIMEOUT" \
+		-sS -o /dev/null "$HEALTH_NAMED_URL" >/dev/null 2>&1 && {
+		named_ok=true
+		probe_successes=$((probe_successes + 1))
+	}
+	[ "$probe_successes" -ge 2 ]
+}
+
+probe_direct_wan_health() {
+	wan_device="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	[ -n "$wan_device" ] || return 1
+	direct_fixed_ok=false
+	direct_named_ok=false
+	curl -4 --connect-timeout 4 --max-time "$HEALTH_TIMEOUT" --interface "$wan_device" \
+		--resolve "$DIRECT_FIXED_RESOLVE" -sS -o /dev/null "$DIRECT_FIXED_URL" >/dev/null 2>&1 && direct_fixed_ok=true
+	curl -4 --connect-timeout 4 --max-time "$HEALTH_TIMEOUT" --interface "$wan_device" \
+		-sS -o /dev/null "$DIRECT_NAMED_URL" >/dev/null 2>&1 && direct_named_ok=true
+	[ "$direct_fixed_ok" = true ] || [ "$direct_named_ok" = true ]
+}
+
+record_incident() {
+	reason="$1"
+	probe_fields=''
+	if [ "$reason" = tunnel_health ]; then
+		probe_fields=" probe_dns=${dns_ok:-unknown} probe_fixed_https=${fixed_ok:-unknown} probe_named_https=${named_ok:-unknown}"
+	fi
+	wan_up="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+	wan_device="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	direct_wan_https=unknown
+	if [ -n "$wan_device" ]; then
+		if curl -4 --connect-timeout 4 --max-time 8 --interface "$wan_device" \
+			--resolve "$DIRECT_FIXED_RESOLVE" -sS -o /dev/null "$DIRECT_FIXED_URL" >/dev/null 2>&1; then
+			direct_wan_https=pass
+		else
+			direct_wan_https=fail
+		fi
+	fi
+	umask 077
+	printf '%s reason=%s uptime_s=%s pid=%s rss_kb=%s available_kb=%s wan_up=%s wan_device=%s direct_wan_https=%s%s\n' \
+		"$(date '+%Y-%m-%dT%H:%M:%S%z')" "$reason" "$(cut -d. -f1 /proc/uptime)" \
+		"$child_pid" "${rss_kb:-unknown}" "${available_kb:-unknown}" "${wan_up:-unknown}" \
+		"${wan_device:-unknown}" "$direct_wan_https" "$probe_fields" >> "$INCIDENT_LOG"
+}
+
+child_alive() {
+	[ -n "$child_pid" ] || return 1
+	[ -r "/proc/$child_pid/stat" ] || return 1
+	[ "$(awk '{print $3}' "/proc/$child_pid/stat" 2>/dev/null)" != Z ]
+}
+
+stop_child() {
+	child_alive || return 0
+	kill -TERM "$child_pid" >/dev/null 2>&1 || true
+	n=0
+	while child_alive && [ "$n" -lt "$STOP_TIMEOUT" ]; do
+		sleep 1
+		n=$((n + 1))
+	done
+	child_alive && kill -KILL "$child_pid" >/dev/null 2>&1 || true
+	wait "$child_pid" >/dev/null 2>&1 || true
+}
+
+cleanup() {
+	stop_child
+	remove_tun
+	remove_health_namespace
+}
+
+trap 'cleanup; exit 0' INT TERM HUP
+
+while :; do
+	remove_tun
+	if setup_health_namespace; then
+		log 'isolated tunnel health probe ready'
+	else
+		log 'isolated tunnel health probe unavailable; continuing with memory supervision'
+	fi
+	GOMEMLIMIT="$GOMEMLIMIT" GOGC="$GOGC" "$XRAY" run -c "$CONFIG" &
+	child_pid=$!
+	log 'xray started'
+	pressure_count=0
+	health_failures=0
+	health_elapsed=0
+	health_deferral_reason=''
+
+	while child_alive; do
+		sleep "$CHECK_INTERVAL"
+		child_alive || break
+		health_elapsed=$((health_elapsed + CHECK_INTERVAL))
+
+		rss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/$child_pid/status" 2>/dev/null)"
+		available_kb="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+		memory_pressure=false
+		[ -n "$rss_kb" ] && [ "$rss_kb" -ge "$MAX_RSS_KB" ] && memory_pressure=true
+		[ -n "$available_kb" ] && [ "$available_kb" -le "$MIN_AVAILABLE_KB" ] && memory_pressure=true
+
+		if [ "$memory_pressure" = true ]; then
+			pressure_count=$((pressure_count + 1))
+		else
+			pressure_count=0
+		fi
+
+		if [ "$pressure_count" -ge "$PRESSURE_CONFIRMATIONS" ]; then
+			log 'memory pressure confirmed; restarting xray'
+			record_incident memory_pressure
+			stop_child
+			break
+		fi
+
+		if [ "$health_namespace_ready" = true ] && [ "$health_elapsed" -ge "$HEALTH_CHECK_INTERVAL" ]; then
+			health_elapsed=0
+			if probe_tunnel_health; then
+				if [ "$health_failures" -gt 0 ]; then
+					log 'tunnel health recovered'
+				fi
+				health_failures=0
+				health_deferral_reason=''
+				post_upstream_retry_available=false
+			else
+				health_failures=$((health_failures + 1))
+				required_health_failures="$HEALTH_FAILURE_CONFIRMATIONS"
+				if [ "$post_upstream_retry_available" = true ] && [ "$health_deferral_reason" != upstream ]; then
+					required_health_failures=2
+				fi
+				log "tunnel health probe failed ($health_failures/$required_health_failures); dns=$dns_ok fixed_https=$fixed_ok named_https=$named_ok"
+				if [ "$health_failures" -ge "$required_health_failures" ]; then
+					if ! probe_direct_wan_health; then
+						if [ "$health_deferral_reason" != upstream ]; then
+							log 'upstream connectivity unavailable; deferring xray restart'
+							record_incident upstream_outage
+						fi
+						health_deferral_reason=upstream
+						post_upstream_retry_available=true
+					else
+						now_uptime="$(cut -d. -f1 /proc/uptime)"
+						since_restart=$((now_uptime - last_health_restart_uptime))
+						if [ "$health_deferral_reason" = upstream ]; then
+							log 'upstream recovered; restarting xray'
+							record_incident tunnel_health
+							last_health_restart_uptime="$now_uptime"
+							health_deferral_reason=''
+							stop_child
+							break
+						elif [ "$post_upstream_retry_available" = true ]; then
+							log 'post-upstream recovery retry; restarting xray'
+							record_incident tunnel_health
+							post_upstream_retry_available=false
+							last_health_restart_uptime="$now_uptime"
+							stop_child
+							break
+						elif [ "$last_health_restart_uptime" -gt 0 ] && [ "$since_restart" -lt "$HEALTH_RESTART_COOLDOWN" ]; then
+							if [ "$health_deferral_reason" != cooldown ]; then
+								log 'tunnel restart cooldown active; deferring xray restart'
+							fi
+							health_deferral_reason=cooldown
+						else
+							log 'tunnel health failure confirmed; restarting xray'
+							record_incident tunnel_health
+							last_health_restart_uptime="$now_uptime"
+							stop_child
+							break
+						fi
+					fi
+				fi
+			fi
+		fi
+	done
+
+	wait "$child_pid" >/dev/null 2>&1 || true
+	child_pid=''
+	remove_tun
+	remove_health_namespace
+	log 'xray stopped; retrying'
+	sleep "$RESTART_DELAY"
+done

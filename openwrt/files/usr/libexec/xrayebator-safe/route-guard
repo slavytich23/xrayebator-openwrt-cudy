@@ -1,0 +1,153 @@
+#!/bin/sh
+
+set -u
+
+TABLE_ID="${XRAYEBATOR_TABLE_ID:-5852}"
+RULE_PRIORITY="${XRAYEBATOR_RULE_PRIORITY:-1000}"
+TUN_DEVICE="${XRAYEBATOR_TUN_DEVICE:-xrayebator0}"
+NFT_TABLE="${XRAYEBATOR_NFT_TABLE:-xrayebator_safe}"
+STATE_FILE="${XRAYEBATOR_STATE_FILE:-/var/run/xrayebator-safe-route.env}"
+DNS_CAPTURE_ADDRESS="${XRAYEBATOR_DNS_CAPTURE_ADDRESS:-1.1.1.1}"
+
+log() {
+	logger -t xrayebator-safe -- "$*"
+}
+
+discover_network() {
+	LAN_DEVICE="${XRAYEBATOR_LAN_DEVICE:-}"
+	WAN_DEVICE="${XRAYEBATOR_WAN_DEVICE:-}"
+	LAN_SUBNET="${XRAYEBATOR_LAN_SUBNET:-}"
+
+	if [ -n "$LAN_DEVICE" ] && [ -n "$WAN_DEVICE" ] && [ -n "$LAN_SUBNET" ]; then
+		return 0
+	fi
+
+	[ -r /lib/functions/network.sh ] || return 1
+	. /lib/functions/network.sh
+	network_flush_cache
+	# OpenWrt 25.12 may unset this cache while the next helper reads it.
+	__NETWORK_CACHE=''
+	network_get_device LAN_DEVICE lan || return 1
+	network_get_device WAN_DEVICE wan || return 1
+	network_get_subnet LAN_SUBNET lan || return 1
+	[ -n "$LAN_DEVICE" ] && [ -n "$WAN_DEVICE" ] && [ -n "$LAN_SUBNET" ]
+}
+
+write_state() {
+	umask 077
+	{
+		printf "LAN_DEVICE='%s'\n" "$LAN_DEVICE"
+		printf "WAN_DEVICE='%s'\n" "$WAN_DEVICE"
+		printf "LAN_SUBNET='%s'\n" "$LAN_SUBNET"
+	} >"$STATE_FILE"
+}
+
+install_guard_table() {
+	nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+	nft -f - <<EOF
+table inet $NFT_TABLE {
+	chain dns_redirect {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "$LAN_DEVICE" meta l4proto { tcp, udp } th dport 53 dnat ip to $DNS_CAPTURE_ADDRESS
+	}
+
+	chain output_guard {
+		type filter hook output priority -5; policy accept;
+		oifname "$WAN_DEVICE" meta l4proto { tcp, udp } th dport 53 reject
+	}
+
+	chain forward_guard {
+		type filter hook forward priority -5; policy accept;
+		iifname "$LAN_DEVICE" oifname "$WAN_DEVICE" reject
+	}
+}
+EOF
+}
+
+install_policy() {
+	ip -4 route replace prohibit default metric 32767 table "$TABLE_ID"
+	install_guard_table
+
+	if ! ip -4 rule show | grep -F "from $LAN_SUBNET" | grep -Fq "iif $LAN_DEVICE lookup $TABLE_ID"; then
+		ip -4 rule add priority "$RULE_PRIORITY" iif "$LAN_DEVICE" from "$LAN_SUBNET" table "$TABLE_ID"
+	fi
+	write_state
+}
+
+remove_policy() {
+	if [ -r "$STATE_FILE" ]; then
+		. "$STATE_FILE"
+	else
+		discover_network >/dev/null 2>&1 || true
+	fi
+
+	nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+	if [ -n "${LAN_SUBNET:-}" ]; then
+		while ip -4 rule del priority "$RULE_PRIORITY" iif "${LAN_DEVICE:-}" from "$LAN_SUBNET" table "$TABLE_ID" >/dev/null 2>&1; do :; done
+	else
+		while ip -4 rule del priority "$RULE_PRIORITY" table "$TABLE_ID" >/dev/null 2>&1; do :; done
+	fi
+	ip -4 route flush table "$TABLE_ID" >/dev/null 2>&1 || true
+	rm -f "$STATE_FILE"
+}
+
+sync_tunnel_route() {
+	if ip link show dev "$TUN_DEVICE" >/dev/null 2>&1; then
+		ip -4 route replace default dev "$TUN_DEVICE" metric 10 table "$TABLE_ID"
+	else
+		ip -4 route del default dev "$TUN_DEVICE" metric 10 table "$TABLE_ID" >/dev/null 2>&1 || true
+	fi
+}
+
+show_status() {
+	policy_ok=false
+	if ip -4 rule show | grep -q "lookup $TABLE_ID" && \
+	   ip -4 route show table "$TABLE_ID" | grep -q '^prohibit default'; then
+		policy_ok=true
+	fi
+	printf 'POLICY_INSTALLED=%s\n' "$policy_ok"
+	if ip link show dev "$TUN_DEVICE" >/dev/null 2>&1 && \
+	   ip -4 route show table "$TABLE_ID" | grep -q "^default dev $TUN_DEVICE"; then
+		printf 'TUN_ROUTE_ACTIVE=true\n'
+	else
+		printf 'TUN_ROUTE_ACTIVE=false\n'
+	fi
+}
+
+run_guard() {
+	discover_network || {
+		log 'cannot discover LAN, WAN, or LAN subnet'
+		return 1
+	}
+	install_policy || {
+		log 'cannot install fail-closed routing policy'
+		return 1
+	}
+	trap 'remove_policy; exit 0' INT TERM HUP
+	log "fail-closed policy active for $LAN_SUBNET"
+	while :; do
+		sync_tunnel_route
+		sleep 1
+	done
+}
+
+case "${1:-run}" in
+	run)
+		run_guard
+		;;
+	setup)
+		discover_network
+		install_policy
+		sync_tunnel_route
+		;;
+	cleanup)
+		remove_policy
+		;;
+	status)
+		show_status
+		;;
+	*)
+		echo "usage: $0 {run|setup|cleanup|status}" >&2
+		exit 2
+		;;
+esac
