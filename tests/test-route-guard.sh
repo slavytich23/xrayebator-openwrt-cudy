@@ -46,6 +46,10 @@ grep -q '^TUN_ROUTE_ACTIVE=true$' <<<"$status"
 ip netns exec "$ns" ip -4 rule show | grep -F 'from 192.168.250.0/24 iif lan0 lookup 5852'
 ip netns exec "$ns" ip -4 route get 192.168.250.2 from 192.168.250.1 | grep -q 'dev lan0'
 ip netns exec "$ns" nft list table inet xrayebator_safe | grep -q 'dnat ip to 1.1.1.1'
+if ip netns exec "$ns" nft list table inet xrayebator_safe | grep -q 'hook output'; then
+	echo 'UNRELATED_ROUTER_OUTPUT_BLOCKED=true'
+	exit 1
+fi
 
 ip netns exec "$ns" ip link del xrayebator0
 ip netns exec "$ns" ip -4 route show table 5852 | grep -q '^prohibit default'

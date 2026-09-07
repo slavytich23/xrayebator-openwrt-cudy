@@ -19,11 +19,15 @@ if [ "$TIMEOUT" -lt 30 ] || [ "$TIMEOUT" -gt 600 ]; then
 fi
 
 "$SERVICE" check >/dev/null
+command -v setsid >/dev/null 2>&1 || {
+	echo 'SETSID_MISSING=true' >&2
+	exit 1
+}
 umask 077
 : >"$PENDING"
 "$SERVICE" start
 
-nohup sh -c "sleep $TIMEOUT; if [ -e '$PENDING' ]; then '$SERVICE' stop; '$SERVICE' disable; logger -t xrayebator-safe 'automatic rollback restored direct internet'; fi" </dev/null >/dev/null 2>&1 &
+setsid sh -c "sleep $TIMEOUT; if [ -e '$PENDING' ]; then '$SERVICE' stop; '$SERVICE' disable; logger -t xrayebator-safe 'automatic rollback restored direct internet'; fi" </dev/null >/dev/null 2>&1 &
 
 echo 'XRAYEBATOR_SAFE_STARTED=true'
 echo "ROLLBACK_SECONDS=$TIMEOUT"

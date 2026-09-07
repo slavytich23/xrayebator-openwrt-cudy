@@ -9,6 +9,7 @@ rollback and Windows failover scripts developed from a real OpenWrt deployment.
 Xrayebator and Xray-core remain separate upstream projects with their own
 licenses and maintainers.
 
-The initial field validation was performed on a Cudy WR3000H 1.0 running
-OpenWrt. No firmware image, private client configuration, subscription URL,
-server address or raw network capture is distributed here.
+Field validation was performed on a Cudy WR3000H 1.0 running OpenWrt, first
+behind another router and later as the primary PPPoE router with separate
+Direct/VPN bridges. No firmware image, private client configuration,
+subscription URL, server address or raw network capture is distributed here.

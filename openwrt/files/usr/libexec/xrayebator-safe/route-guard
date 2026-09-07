@@ -14,6 +14,7 @@ log() {
 }
 
 discover_network() {
+	LAN_NETWORK="${XRAYEBATOR_LAN_NETWORK:-lan}"
 	LAN_DEVICE="${XRAYEBATOR_LAN_DEVICE:-}"
 	WAN_DEVICE="${XRAYEBATOR_WAN_DEVICE:-}"
 	LAN_SUBNET="${XRAYEBATOR_LAN_SUBNET:-}"
@@ -27,15 +28,22 @@ discover_network() {
 	network_flush_cache
 	# OpenWrt 25.12 may unset this cache while the next helper reads it.
 	__NETWORK_CACHE=''
-	network_get_device LAN_DEVICE lan || return 1
-	network_get_device WAN_DEVICE wan || return 1
-	network_get_subnet LAN_SUBNET lan || return 1
+	if [ -z "$LAN_DEVICE" ]; then
+		network_get_device LAN_DEVICE "$LAN_NETWORK" || return 1
+	fi
+	if [ -z "$WAN_DEVICE" ]; then
+		network_get_device WAN_DEVICE wan || return 1
+	fi
+	if [ -z "$LAN_SUBNET" ]; then
+		network_get_subnet LAN_SUBNET "$LAN_NETWORK" || return 1
+	fi
 	[ -n "$LAN_DEVICE" ] && [ -n "$WAN_DEVICE" ] && [ -n "$LAN_SUBNET" ]
 }
 
 write_state() {
 	umask 077
 	{
+		printf "LAN_NETWORK='%s'\n" "$LAN_NETWORK"
 		printf "LAN_DEVICE='%s'\n" "$LAN_DEVICE"
 		printf "WAN_DEVICE='%s'\n" "$WAN_DEVICE"
 		printf "LAN_SUBNET='%s'\n" "$LAN_SUBNET"
@@ -49,11 +57,6 @@ table inet $NFT_TABLE {
 	chain dns_redirect {
 		type nat hook prerouting priority dstnat; policy accept;
 		iifname "$LAN_DEVICE" meta l4proto { tcp, udp } th dport 53 dnat ip to $DNS_CAPTURE_ADDRESS
-	}
-
-	chain output_guard {
-		type filter hook output priority -5; policy accept;
-		oifname "$WAN_DEVICE" meta l4proto { tcp, udp } th dport 53 reject
 	}
 
 	chain forward_guard {

@@ -1,0 +1,8 @@
+config service 'main'
+	option client_network 'lan'
+	option client_device 'br-lan'
+	option client_subnet '192.168.10.0/24'
+	option health_bridge 'br-lan'
+	option health_address '192.168.10.252/24'
+	option health_gateway '192.168.10.1'
+	option health_dns_server '192.168.10.1'
