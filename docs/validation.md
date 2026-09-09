@@ -46,6 +46,21 @@ Fresh primary signals after the cutover:
 
 This was a short cutover validation, not a long-duration reliability claim.
 
+## Follow-up field observations — 2026-09-10
+
+Repeated memory-threshold restarts remain observed. In the last twelve inspected
+incidents, Xray RSS was approximately 105000–108000 KiB while MemAvailable
+was approximately 37000–46000 KiB. The existing memory protection and thresholds
+have deliberately not been changed. Short successful probes do not establish
+uninterrupted service.
+
+The VPN bridge was observed using its temporary health-veth MAC with no explicit
+UCI MAC setting. Pinning its current address in UCI and at runtime succeeded
+without restarting networking. Windows retained its current network profile;
+router-side VPN and Direct HTTPS probes both returned 200. Persistence across
+a router reboot and long-term absence of new Windows profiles are not yet
+field-verified.
+
 ## Repository checks
 
 `tests/run-all.ps1` verifies:

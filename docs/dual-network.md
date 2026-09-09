@@ -69,6 +69,22 @@ manual rollback command below remains available as a second recovery path.
 
 ## Activate and verify Xray
 
+Before activation, pin the VPN bridge's current MAC address:
+
+```sh
+sh ./pin-vpn-bridge-mac.sh
+APPLY_CHANGES=1 sh ./pin-vpn-bridge-mac.sh
+```
+
+Use this step on existing deployments too. Without an explicit bridge MAC,
+the bridge can inherit the random MAC of the health-probe veth. Recreating
+that interface can change the gateway identity and make Windows create another
+numbered network profile. The helper preserves the current address at runtime
+and in UCI, backs up the network configuration, and does not reload networking.
+It refuses to proceed with pending network edits. It prints the backup path
+before applying changes; retain it for recovery. No household-specific MAC is
+included in this repository.
+
 Validate the private Xray config and use staged activation:
 
 ```sh

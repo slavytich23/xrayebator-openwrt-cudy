@@ -25,7 +25,8 @@ $shellFiles = @(
     '..\tools\configure-dual-network.sh',
     '..\tools\finalize-dual-network.sh',
     '..\tools\rollback-dual-network.sh',
-    '..\tools\verify-dual-network.sh'
+    '..\tools\verify-dual-network.sh',
+    '..\tools\pin-vpn-bridge-mac.sh'
 )
 
 foreach ($relativePath in $shellFiles) {
